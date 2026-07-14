@@ -1,8 +1,89 @@
 #include "behaviortree_cpp/loggers/groot2_publisher.h"
 #include "behaviortree_cpp/loggers/groot2_protocol.h"
+#include "behaviortree_cpp/json_export.h"
 #include "behaviortree_cpp/xml_parsing.h"
 #include "cppzmq/zmq.hpp"
 #include "cppzmq/zmq_addon.hpp"
+
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
+#include <string_view>
+
+namespace {
+  /**
+   * @brief Maximum serialized size (bytes) of a single blackboard entry that Groot2 is
+   * allowed to receive. Entries above this are replaced with a short placeholder.
+   *
+   * The Groot2 server runs a single-threaded, strict REQ/REP loop with tight timeouts.
+   * One oversized value (e.g. an image/observation queue) can take long enough to
+   * serialize that the Groot2 client times out, drops to "connecting" and reloads the
+   * tree from the root. Capping per-entry size bounds the worst-case reply time.
+   *
+   * Override with the WA_GROOT2_BB_ENTRY_MAX_BYTES environment variable (0 disables).
+   */
+  size_t blackboardEntryMaxBytes()
+  {
+    static const size_t value = [] {
+      constexpr size_t default_limit = 64 * 1024;  // 64 KiB
+      if(const char* env = std::getenv("WA_GROOT2_BB_ENTRY_MAX_BYTES"))
+      {
+        char* end = nullptr;
+        const unsigned long parsed = std::strtoul(env, &end, 10);
+        if(end != env)
+        {
+          return static_cast<size_t>(parsed);
+        }
+      }
+      return default_limit;
+    }();
+    return value;
+  }
+
+  /**
+   * @brief Whether to log timing/size of every blackboard dump to stderr.
+   * Enable with WA_GROOT2_BB_DEBUG=1. When disabled, only dumps that omit an
+   * oversized entry are logged.
+   */
+  bool blackboardDebugEnabled()
+  {
+    static const bool enabled = [] {
+      const char* env = std::getenv("WA_GROOT2_BB_DEBUG");
+      return env != nullptr && std::string_view(env) != "0";
+    }();
+    return enabled;
+  }
+
+  /**
+   * @brief Due to Groot crashing when receiving json arrays in blackboards, we convert all
+   * arrays to mappings with stringified indices as keys.
+   */
+  nlohmann::json convert_lists_to_mappings(nlohmann::json& json_to_convert)
+  {
+    if(json_to_convert.is_array())
+    {
+      nlohmann::json converted_object = nlohmann::json::object();
+      for(size_t i = 0; i < json_to_convert.size(); ++i)
+      {
+        converted_object[std::to_string(i)] = convert_lists_to_mappings(json_to_convert[i]);
+      }
+      return converted_object;
+    }
+    else if(json_to_convert.is_object())
+    {
+      nlohmann::json converted_object = nlohmann::json::object();
+      for(auto& [key, value] : json_to_convert.items())
+      {
+        converted_object[key] = convert_lists_to_mappings(value);
+      }
+      return converted_object;
+    }
+    else
+    {
+      return json_to_convert;
+    }
+  }
+}
 
 namespace BT
 {
@@ -517,23 +598,86 @@ void Groot2Publisher::heartbeatLoop()
 
 std::vector<uint8_t> Groot2Publisher::generateBlackboardsDump(const std::string& bb_list)
 {
+  const auto t_start = std::chrono::steady_clock::now();
+  const size_t max_entry_bytes = blackboardEntryMaxBytes();
+  size_t omitted_entries = 0;
+
   auto json = nlohmann::json();
   auto const bb_names = BT::splitString(bb_list, ';');
   for(auto name : bb_names)
   {
     std::string const bb_name(name);
     auto it = _p->subtrees.find(bb_name);
-
-    if(it != _p->subtrees.end())
+    if(it == _p->subtrees.end())
     {
-      // lock the weak pointer
-      if(auto subtree = it->second.lock())
+      continue;
+    }
+    // lock the weak pointer
+    auto subtree = it->second.lock();
+    if(!subtree)
+    {
+      continue;
+    }
+
+    // Serialize entry-by-entry so a single oversized value can be dropped without
+    // discarding the rest of the subtree's blackboard (mirrors ExportBlackboardToJSON).
+    auto& bb_out = json[bb_name];
+    bb_out = nlohmann::json::object();
+
+    for(const auto entry_key : subtree->blackboard->getKeys())
+    {
+      std::string const key(entry_key);
+      auto any_ref = subtree->blackboard->getAnyLocked(key);
+      if(!any_ref)
       {
-        json[bb_name] = ExportBlackboardToJSON(*subtree->blackboard);
+        continue;
       }
+      auto any_ptr = any_ref.get();
+      if(any_ptr == nullptr)
+      {
+        continue;
+      }
+
+      nlohmann::json entry_json;
+      // Returns false for types without a registered converter: Groot2 could not
+      // display those anyway, so skip them.
+      if(!JsonExporter::get().toJson(*any_ptr, entry_json))
+      {
+        continue;
+      }
+
+      // Bound the cost/size of a single entry. Measured on the raw (pre-mapping)
+      // msgpack size, which is a lower bound on the wire size after
+      // convert_lists_to_mappings (that step only inflates arrays into objects).
+      if(max_entry_bytes != 0)
+      {
+        const size_t entry_bytes = nlohmann::json::to_msgpack(entry_json).size();
+        if(entry_bytes > max_entry_bytes)
+        {
+          bb_out[key] = StrCat("<omitted: ", std::to_string(entry_bytes),
+                               " bytes exceeds Groot2 dump limit>");
+          ++omitted_entries;
+          continue;
+        }
+      }
+
+      bb_out[key] = convert_lists_to_mappings(entry_json);
     }
   }
-  return nlohmann::json::to_msgpack(json);
+
+  auto msg = nlohmann::json::to_msgpack(json);
+
+  if(blackboardDebugEnabled() || omitted_entries > 0)
+  {
+    const auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - t_start)
+                                .count();
+    std::cerr << "[Groot2Publisher] blackboard dump: subtrees=[" << bb_list
+              << "] bytes=" << msg.size() << " omitted=" << omitted_entries
+              << " took=" << (static_cast<double>(elapsed_us) / 1000.0) << "ms\n";
+  }
+
+  return msg;
 }
 
 bool Groot2Publisher::insertHook(std::shared_ptr<Monitor::Hook> hook)
